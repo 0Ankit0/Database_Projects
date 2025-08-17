@@ -213,14 +213,18 @@ def write_if_changed(path: Path, content_sql: str, metadata: dict = None) -> boo
 	Header (comment box) is prepended but not included in hash comparisons.
 	Returns True if file was written/updated (or would be in dry-run), False if unchanged.
 	"""
-	# Register expected main file and sidecar
+	# Register expected main file and sidecar (store sidecars in a sibling _sha256 folder)
 	EXPECTED_PATHS.add(str(path.resolve()))
-	EXPECTED_PATHS.add(str(path.with_name(path.name + ".sha256").resolve()))
+	sidecar_dir = path.parent / '_sha256'
+	sidecar_dir.mkdir(parents=True, exist_ok=True)
+	sidecar_path = sidecar_dir / (path.name + '.sha256')
+	EXPECTED_PATHS.add(str(sidecar_path.resolve()))
 
 	sql_data = content_sql if content_sql.endswith("\n") else content_sql + "\n"
 	sql_bytes = sql_data.encode("utf8")
 	new_hash = compute_hash_bytes(sql_bytes)
-	hash_path = path.with_name(path.name + ".sha256")
+	# Write/read sidecar from the dedicated _sha256 folder
+	hash_path = path.parent / '_sha256' / (path.name + '.sha256')
 
 	# Quick sidecar check
 	if hash_path.exists():
@@ -324,7 +328,7 @@ def dump_tables(conn, conninfo: dict, outdir: Path, include_data: bool = False) 
 	
 	for schema, name in rows:
 		fullname = f"{schema}.{name}"
-		target = outdir / "tables" / schema / f"{name}.table.psql"
+		target = outdir / "tables" / schema / f"{name}.psql"
 		
 		# Extract this table's DDL from the full schema dump
 		if name in tables_dict:
@@ -354,9 +358,11 @@ def dump_tables(conn, conninfo: dict, outdir: Path, include_data: bool = False) 
 
 
 def parse_schema_for_tables(schema_ddl: str) -> dict:
-	"""Parse full schema DDL and extract individual table definitions"""
+	"""Parse full schema DDL and extract ALL code related to each table (CREATE TABLE, ALTER TABLE, constraints, etc.)"""
 	tables = {}
 	lines = schema_ddl.split('\n')
+	
+	# First pass: Extract CREATE TABLE blocks
 	current_table = None
 	current_table_lines = []
 	in_table = False
@@ -381,8 +387,18 @@ def parse_schema_for_tables(schema_ddl: str) -> dict:
 				current_table_lines = []
 				in_table = False
 		elif in_table:
-			# Check if this line ends the current table
-			if line.strip().startswith('--') and ('Name:' in line and ('Type: TABLE' in line or 'Type: SEQUENCE' in line)):
+			# Check if this line ends the current table (CREATE TABLE block ends with );)
+			if line.strip().endswith(');') and 'CREATE TABLE' in '\n'.join(current_table_lines):
+				current_table_lines.append(line)
+				# Save the completed CREATE TABLE block
+				if current_table and current_table_lines:
+					while current_table_lines and not current_table_lines[-1].strip():
+						current_table_lines.pop()
+					tables[current_table] = '\n'.join(current_table_lines)
+				current_table = None
+				current_table_lines = []
+				in_table = False
+			elif line.strip().startswith('--') and ('Name:' in line and ('Type: TABLE' in line or 'Type: SEQUENCE' in line or 'Type: INDEX' in line)):
 				# This is a comment for a new object - end current table
 				if current_table and current_table_lines:
 					# Remove trailing empty lines and save
@@ -409,7 +425,116 @@ def parse_schema_for_tables(schema_ddl: str) -> dict:
 		while current_table_lines and not current_table_lines[-1].strip():
 			current_table_lines.pop()
 		tables[current_table] = '\n'.join(current_table_lines)
+
+	# Second pass: Collect ALL statements that reference each table
+	table_related_statements = {table: [] for table in tables.keys()}
 	
+	i = 0
+	while i < len(lines):
+		line = lines[i].strip()
+		
+		# Look for ALTER TABLE statements
+		if line.upper().startswith('ALTER TABLE'):
+			# Capture the preceding comment block if any
+			comment_start = i
+			while comment_start > 0 and (lines[comment_start-1].lstrip().startswith('--') or lines[comment_start-1].strip() == ''):
+				comment_start -= 1
+			
+			# Collect the full ALTER TABLE statement until semicolon
+			stmt_lines = []
+			j = i
+			while j < len(lines):
+				stmt_lines.append(lines[j])
+				if lines[j].strip().endswith(';'):
+					break
+				j += 1
+			
+			# Combine comment block with statement
+			full_block = lines[comment_start:j+1]
+			full_stmt = '\n'.join(full_block).strip()
+			
+			# Extract table name(s) referenced in this statement
+			table_refs = re.findall(r'(?:public\.)?"?([^"\s\(\),]+)"?(?=\s|$|\.|\(|\)|,)', full_stmt)
+			table_refs = [ref for ref in table_refs if ref in tables and ref not in ['public', 'ONLY', 'TABLE', 'ADD', 'CONSTRAINT']]
+			
+			# More specific table name extraction for ALTER TABLE
+			alter_match = re.search(r'ALTER TABLE(?:\s+ONLY)?\s+(?:public\.)?"?([^"\s]+)"?', full_stmt, flags=re.I)
+			if alter_match:
+				primary_table = alter_match.group(1)
+				if primary_table in tables:
+					table_related_statements[primary_table].append(full_stmt)
+			
+			i = j + 1
+		
+		# Look for CREATE INDEX statements
+		elif line.upper().startswith('CREATE') and 'INDEX' in line.upper():
+			# Capture the preceding comment block if any
+			comment_start = i
+			while comment_start > 0 and (lines[comment_start-1].lstrip().startswith('--') or lines[comment_start-1].strip() == ''):
+				comment_start -= 1
+			
+			# Collect the full CREATE INDEX statement until semicolon
+			stmt_lines = []
+			j = i
+			while j < len(lines):
+				stmt_lines.append(lines[j])
+				if lines[j].strip().endswith(';'):
+					break
+				j += 1
+			
+			# Combine comment block with statement
+			full_block = lines[comment_start:j+1]
+			full_stmt = '\n'.join(full_block).strip()
+			
+			# Extract table name from CREATE INDEX ... ON table_name
+			index_match = re.search(r'ON\s+(?:public\.)?"?([^"\s\(]+)"?', full_stmt, flags=re.I)
+			if index_match:
+				table_name = index_match.group(1)
+				if table_name in tables:
+					table_related_statements[table_name].append(full_stmt)
+			
+			i = j + 1
+		
+		# Look for other statements that might reference tables (COMMENT ON, etc.)
+		elif any(keyword in line.upper() for keyword in ['COMMENT ON TABLE', 'GRANT', 'REVOKE']) and 'public.' in line:
+			# Capture the full statement until semicolon
+			stmt_lines = []
+			j = i
+			while j < len(lines):
+				stmt_lines.append(lines[j])
+				if lines[j].strip().endswith(';'):
+					break
+				j += 1
+			
+			full_stmt = '\n'.join(stmt_lines).strip()
+			
+			# Extract table names
+			table_refs = re.findall(r'(?:public\.)?"?([^"\s\(\),]+)"?', full_stmt)
+			for table_ref in table_refs:
+				if table_ref in tables:
+					table_related_statements[table_ref].append(full_stmt)
+			
+			i = j + 1
+		else:
+			i += 1
+	
+	# Third pass: Append all related statements to their respective tables
+	for table_name, statements in table_related_statements.items():
+		if statements and table_name in tables:
+			# Remove duplicates while preserving order
+			seen = set()
+			unique_statements = []
+			for stmt in statements:
+				if stmt not in seen:
+					seen.add(stmt)
+					unique_statements.append(stmt)
+			
+			if unique_statements:
+				# Append statements after the table DDL
+				existing = tables[table_name].rstrip() + '\n\n'
+				existing += '\n\n'.join(unique_statements) + '\n'
+				tables[table_name] = existing
+
 	return tables
 
 
@@ -427,7 +552,7 @@ def dump_views(conn, conninfo: dict, outdir: Path) -> int:
 	changed = 0
 	for schema, name in rows:
 		fullname = f"{schema}.{name}"
-		target = outdir / "views" / schema / f"{name}.view.psql"
+		target = outdir / "views" / schema / f"{name}.psql"
 		try:
 			ddl = run_pg_dump(conninfo, ["--table", fullname])
 		except Exception as e:
@@ -455,7 +580,7 @@ def dump_matviews(conn, conninfo: dict, outdir: Path) -> int:
 	changed = 0
 	for schema, name in rows:
 		fullname = f"{schema}.{name}"
-		target = outdir / "matviews" / schema / f"{name}.matview.psql"
+		target = outdir / "matviews" / schema / f"{name}.psql"
 		try:
 			ddl = run_pg_dump(conninfo, ["--table", fullname])
 		except Exception as e:
@@ -494,8 +619,8 @@ def dump_sequences(conn, conninfo: dict, outdir: Path) -> int:
 	
 	for schema, name in rows:
 		fullname = f"{schema}.{name}"
-		target = outdir / "sequences" / schema / f"{name}.sequence.psql"
-		
+		target = outdir / "sequences" / schema / f"{name}.psql"
+
 		# Extract this sequence's DDL from the full schema dump
 		if name in sequences_dict:
 			ddl = sequences_dict[name]
@@ -594,7 +719,7 @@ def dump_functions_procedures(conn, outdir: Path) -> int:
 			argsig = ""
 
 		safe_args = re.sub(r"\W+", "_", argsig).strip("_") or "noargs"
-		filename = f"{name}__{safe_args}.{'procedure' if prokind=='p' else 'function'}.psql"
+		filename = f"{name}__{safe_args}.psql"
 		target = outdir / folder / schema / filename
 		content = normalize_sql(definition) + "\n"
 		if write_if_changed(target, content):
@@ -621,7 +746,7 @@ def dump_triggers(conn, outdir: Path) -> int:
 	rows = cur.fetchall()
 	changed = 0
 	for oid, schema, table, tgname, definition in rows:
-		fname = f"{table}__{tgname}.trigger.psql"
+		fname = f"{table}__{tgname}.psql"
 		target = outdir / "triggers" / schema / fname
 		content = f"-- Trigger: {schema}.{table}.{tgname}\n\n{definition}\n"
 		if write_if_changed(target, content):

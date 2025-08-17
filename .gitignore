@@ -1,0 +1,14 @@
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.sqlite3
+# ignore pgpass files and any local secrets
+pgpass.conf
+# ignore generated SQL sidecars and stale folder
+**/_stale/
+**/*.sha256
+
+# ignore dumps if you produce them in the repo (adjust as needed)
+sql-by-object/

@@ -1,0 +1,17 @@
+-- ------------------------------------------------------------
+-- File: historicdata_id_seq.psql
+-- Created: 2025-08-19T01:06:58.423553+00:00
+-- Modified: 2025-08-19T01:06:58.423572+00:00
+-- Modified-By: ankit
+-- ------------------------------------------------------------
+CREATE SEQUENCE public.historicdata_id_seq
+    AS integer
+    START WITH 1
+    INCREMENT BY 1
+    NO MINVALUE
+    NO MAXVALUE
+    CACHE 1;
+
+
+--
+-- Name: historicdata_id_seq; Type: SEQUENCE OWNED BY; Schema: public; Owner: -

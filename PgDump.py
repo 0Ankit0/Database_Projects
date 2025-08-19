@@ -13,7 +13,6 @@ Requires:
 """
 
 from pathlib import Path
-import argparse
 import os
 import sys
 import subprocess
@@ -316,35 +315,43 @@ def dump_tables(conn, conninfo: dict, outdir: Path, include_data: bool = False) 
 	rows = cur.fetchall()
 	changed = 0
 	
-	# Get the full schema dump once
-	try:
-		full_schema_ddl = run_pg_dump(conninfo, ["--schema-only", "--schema", "public"])
-	except Exception as e:
-		print(f"Warning: failed to dump schema: {e}", file=sys.stderr)
-		return 0
-	
-	# Parse the full schema to extract individual table definitions
-	tables_dict = parse_schema_for_tables(full_schema_ddl)
-	
+	# Get the full schema dump for each schema
+	schema_tables = {}
+	schema_ddl = {}
+	for schema, _ in rows:
+		if schema not in schema_ddl:
+			try:
+				schema_ddl[schema] = run_pg_dump(conninfo, ["--schema-only", "--schema", schema])
+			except Exception as e:
+				print(f"Warning: failed to dump schema {schema}: {e}", file=sys.stderr)
+				schema_ddl[schema] = ""
+			schema_tables[schema] = parse_schema_for_tables(schema_ddl[schema])
+
 	for schema, name in rows:
 		fullname = f"{schema}.{name}"
 		target = outdir / "tables" / schema / f"{name}.psql"
-		
-		# Extract this table's DDL from the full schema dump
+
+		# Extract this table's DDL from the schema dump for its schema
+		tables_dict = schema_tables.get(schema, {})
+		ddl = None
+		# Try both qualified and unqualified names
 		if name in tables_dict:
 			ddl = tables_dict[name]
+		elif f"{schema}.{name}" in tables_dict:
+			ddl = tables_dict[f"{schema}.{name}"]
+		if ddl:
 			ddl = normalize_sql(ddl)
 			if write_if_changed(target, ddl):
 				changed += 1
 				print(f"Updated: {target}")
 		else:
-			print(f"Warning: table {name} not found in schema dump", file=sys.stderr)
+			print(f"Warning: table {name} not found in schema dump for schema {schema}", file=sys.stderr)
 
 		if include_data:
 			data_target = outdir / "tables" / schema / f"{name}.data.psql"
 			try:
 				# For data, we can try the individual table approach
-				data_sql = run_pg_dump(conninfo, ["--data-only", "--table", f'"{name}"']) 
+				data_sql = run_pg_dump(conninfo, ["--data-only", "--table", f'{schema}."{name}"'])
 				data_sql = normalize_sql(data_sql)
 				if write_if_changed(data_target, data_sql):
 					changed += 1
@@ -361,59 +368,61 @@ def parse_schema_for_tables(schema_ddl: str) -> dict:
 	"""Parse full schema DDL and extract ALL code related to each table (CREATE TABLE, ALTER TABLE, constraints, etc.)"""
 	tables = {}
 	lines = schema_ddl.split('\n')
-	
-	# First pass: Extract CREATE TABLE blocks
 	current_table = None
 	current_table_lines = []
 	in_table = False
+	current_schema = None
 	
 	for line in lines:
 		# Look for CREATE TABLE statements
-		if line.strip().startswith('CREATE TABLE'):
+		m = re.match(r'CREATE TABLE (?:([\w]+)\.)?"?([^\"]+)"?', line.strip())
+		if m:
 			if current_table and current_table_lines:
 				# Save previous table (remove trailing empty lines)
 				while current_table_lines and not current_table_lines[-1].strip():
 					current_table_lines.pop()
-				tables[current_table] = '\n'.join(current_table_lines)
-			
-			# Start new table
-			table_match = re.search(r'CREATE TABLE (?:public\.)?\"?([^\"]+)\"?', line)
-			if table_match:
-				current_table = table_match.group(1)
-				current_table_lines = [line]
-				in_table = True
-			else:
-				current_table = None
-				current_table_lines = []
-				in_table = False
+				# Clean up table name keys
+				key = current_table.strip().rstrip(' (')
+				tables[key] = '\n'.join(current_table_lines)
+				if current_schema:
+					tables[f"{current_schema}.{key}"] = '\n'.join(current_table_lines)
+			current_schema = m.group(1) or 'public'
+			current_table = m.group(2)
+			current_table_lines = [line]
+			in_table = True
 		elif in_table:
 			# Check if this line ends the current table (CREATE TABLE block ends with );)
 			if line.strip().endswith(');') and 'CREATE TABLE' in '\n'.join(current_table_lines):
 				current_table_lines.append(line)
-				# Save the completed CREATE TABLE block
 				if current_table and current_table_lines:
 					while current_table_lines and not current_table_lines[-1].strip():
 						current_table_lines.pop()
-					tables[current_table] = '\n'.join(current_table_lines)
+					key = current_table.strip().rstrip(' (')
+					tables[key] = '\n'.join(current_table_lines)
+					if current_schema:
+						tables[f"{current_schema}.{key}"] = '\n'.join(current_table_lines)
 				current_table = None
 				current_table_lines = []
 				in_table = False
 			elif line.strip().startswith('--') and ('Name:' in line and ('Type: TABLE' in line or 'Type: SEQUENCE' in line or 'Type: INDEX' in line)):
-				# This is a comment for a new object - end current table
 				if current_table and current_table_lines:
-					# Remove trailing empty lines and save
 					while current_table_lines and not current_table_lines[-1].strip():
 						current_table_lines.pop()
-					tables[current_table] = '\n'.join(current_table_lines)
+					key = current_table.strip().rstrip(' (')
+					tables[key] = '\n'.join(current_table_lines)
+					if current_schema:
+						tables[f"{current_schema}.{key}"] = '\n'.join(current_table_lines)
 				current_table = None
 				current_table_lines = []
 				in_table = False
 			elif line.strip().startswith('CREATE '):
-				# New CREATE statement - end current table
 				if current_table and current_table_lines:
 					while current_table_lines and not current_table_lines[-1].strip():
 						current_table_lines.pop()
-					tables[current_table] = '\n'.join(current_table_lines)
+					key = current_table.strip().rstrip(' (')
+					tables[key] = '\n'.join(current_table_lines)
+					if current_schema:
+						tables[f"{current_schema}.{key}"] = '\n'.join(current_table_lines)
 				current_table = None
 				current_table_lines = []
 				in_table = False
@@ -424,145 +433,11 @@ def parse_schema_for_tables(schema_ddl: str) -> dict:
 	if current_table and current_table_lines:
 		while current_table_lines and not current_table_lines[-1].strip():
 			current_table_lines.pop()
-		tables[current_table] = '\n'.join(current_table_lines)
-
-	# Second pass: Collect ALL statements that reference each table
-	table_related_statements = {table: [] for table in tables.keys()}
-	
-	i = 0
-	while i < len(lines):
-		line = lines[i].strip()
-		
-		# Look for ALTER TABLE statements
-		if line.upper().startswith('ALTER TABLE'):
-			# Capture the preceding comment block if any
-			comment_start = i
-			while comment_start > 0 and (lines[comment_start-1].lstrip().startswith('--') or lines[comment_start-1].strip() == ''):
-				comment_start -= 1
-			
-			# Collect the full ALTER TABLE statement until semicolon
-			stmt_lines = []
-			j = i
-			while j < len(lines):
-				stmt_lines.append(lines[j])
-				if lines[j].strip().endswith(';'):
-					break
-				j += 1
-			
-			# Combine comment block with statement
-			full_block = lines[comment_start:j+1]
-			full_stmt = '\n'.join(full_block).strip()
-			
-			# Extract table name(s) referenced in this statement
-			table_refs = re.findall(r'(?:public\.)?"?([^"\s\(\),]+)"?(?=\s|$|\.|\(|\)|,)', full_stmt)
-			table_refs = [ref for ref in table_refs if ref in tables and ref not in ['public', 'ONLY', 'TABLE', 'ADD', 'CONSTRAINT']]
-			
-			# More specific table name extraction for ALTER TABLE
-			alter_match = re.search(r'ALTER TABLE(?:\s+ONLY)?\s+(?:public\.)?"?([^"\s]+)"?', full_stmt, flags=re.I)
-			if alter_match:
-				primary_table = alter_match.group(1)
-				if primary_table in tables:
-					table_related_statements[primary_table].append(full_stmt)
-			
-			i = j + 1
-		
-		# Look for CREATE INDEX statements
-		elif line.upper().startswith('CREATE') and 'INDEX' in line.upper():
-			# Capture the preceding comment block if any
-			comment_start = i
-			while comment_start > 0 and (lines[comment_start-1].lstrip().startswith('--') or lines[comment_start-1].strip() == ''):
-				comment_start -= 1
-			
-			# Collect the full CREATE INDEX statement until semicolon
-			stmt_lines = []
-			j = i
-			while j < len(lines):
-				stmt_lines.append(lines[j])
-				if lines[j].strip().endswith(';'):
-					break
-				j += 1
-			
-			# Combine comment block with statement
-			full_block = lines[comment_start:j+1]
-			full_stmt = '\n'.join(full_block).strip()
-			
-			# Extract table name from CREATE INDEX ... ON table_name
-			index_match = re.search(r'ON\s+(?:public\.)?"?([^"\s\(]+)"?', full_stmt, flags=re.I)
-			if index_match:
-				table_name = index_match.group(1)
-				if table_name in tables:
-					table_related_statements[table_name].append(full_stmt)
-			
-			i = j + 1
-		
-		# Look for other statements that might reference tables (COMMENT ON, etc.)
-		elif any(keyword in line.upper() for keyword in ['COMMENT ON TABLE', 'GRANT', 'REVOKE']) and 'public.' in line:
-			# Capture the full statement until semicolon
-			stmt_lines = []
-			j = i
-			while j < len(lines):
-				stmt_lines.append(lines[j])
-				if lines[j].strip().endswith(';'):
-					break
-				j += 1
-			
-			full_stmt = '\n'.join(stmt_lines).strip()
-			
-			# Extract table names
-			table_refs = re.findall(r'(?:public\.)?"?([^"\s\(\),]+)"?', full_stmt)
-			for table_ref in table_refs:
-				if table_ref in tables:
-					table_related_statements[table_ref].append(full_stmt)
-			
-			i = j + 1
-		else:
-			i += 1
-	
-	# Third pass: Append all related statements to their respective tables
-	for table_name, statements in table_related_statements.items():
-		if statements and table_name in tables:
-			# Remove duplicates while preserving order
-			seen = set()
-			unique_statements = []
-			for stmt in statements:
-				if stmt not in seen:
-					seen.add(stmt)
-					unique_statements.append(stmt)
-			
-			if unique_statements:
-				# Append statements after the table DDL
-				existing = tables[table_name].rstrip() + '\n\n'
-				existing += '\n\n'.join(unique_statements) + '\n'
-				tables[table_name] = existing
-
+		key = current_table.strip().rstrip(' (')
+		tables[key] = '\n'.join(current_table_lines)
+		if current_schema:
+			tables[f"{current_schema}.{key}"] = '\n'.join(current_table_lines)
 	return tables
-
-
-def dump_views(conn, conninfo: dict, outdir: Path) -> int:
-	cur = conn.cursor()
-	cur.execute(
-		"""
-		SELECT table_schema, table_name
-		FROM information_schema.views
-		WHERE table_schema NOT IN ('pg_catalog','information_schema','pg_toast')
-		ORDER BY table_schema, table_name
-		"""
-	)
-	rows = cur.fetchall()
-	changed = 0
-	for schema, name in rows:
-		fullname = f"{schema}.{name}"
-		target = outdir / "views" / schema / f"{name}.psql"
-		try:
-			ddl = run_pg_dump(conninfo, ["--table", fullname])
-		except Exception as e:
-			print(f"Warning: failed to dump view {fullname}: {e}", file=sys.stderr)
-			continue
-		if write_if_changed(target, ddl):
-			changed += 1
-			print(f"Updated: {target}")
-	cur.close()
-	return changed
 
 
 def dump_matviews(conn, conninfo: dict, outdir: Path) -> int:
@@ -607,21 +482,24 @@ def dump_sequences(conn, conninfo: dict, outdir: Path) -> int:
 	rows = cur.fetchall()
 	changed = 0
 	
-	# Get the full schema dump once
-	try:
-		full_schema_ddl = run_pg_dump(conninfo, ["--schema-only", "--schema", "public"])
-	except Exception as e:
-		print(f"Warning: failed to dump schema for sequences: {e}", file=sys.stderr)
-		return 0
-	
-	# Parse the full schema to extract individual sequence definitions
-	sequences_dict = parse_schema_for_sequences(full_schema_ddl)
-	
+	# Get the full schema dump for each schema
+	schema_sequences = {}
+	schema_ddl = {}
+	for schema, _ in rows:
+		if schema not in schema_ddl:
+			try:
+				schema_ddl[schema] = run_pg_dump(conninfo, ["--schema-only", "--schema", schema])
+			except Exception as e:
+				print(f"Warning: failed to dump schema for sequences in {schema}: {e}", file=sys.stderr)
+				schema_ddl[schema] = ""
+			schema_sequences[schema] = parse_schema_for_sequences(schema_ddl[schema])
+
 	for schema, name in rows:
 		fullname = f"{schema}.{name}"
 		target = outdir / "sequences" / schema / f"{name}.psql"
 
-		# Extract this sequence's DDL from the full schema dump
+		# Extract this sequence's DDL from the schema dump for its schema
+		sequences_dict = schema_sequences.get(schema, {})
 		if name in sequences_dict:
 			ddl = sequences_dict[name]
 			ddl = normalize_sql(ddl)
@@ -629,8 +507,8 @@ def dump_sequences(conn, conninfo: dict, outdir: Path) -> int:
 				changed += 1
 				print(f"Updated: {target}")
 		else:
-			print(f"Warning: sequence {name} not found in schema dump", file=sys.stderr)
-	
+			print(f"Warning: sequence {name} not found in schema dump for schema {schema}", file=sys.stderr)
+
 	cur.close()
 	return changed
 
@@ -642,35 +520,34 @@ def parse_schema_for_sequences(schema_ddl: str) -> dict:
 	current_sequence = None
 	current_sequence_lines = []
 	in_sequence = False
-	
+	current_schema = None
+    
 	for line in lines:
-		# Look for ALTER TABLE ... ALTER COLUMN ... ADD GENERATED BY DEFAULT AS IDENTITY
-		if re.search(r'ALTER TABLE.*ALTER COLUMN.*ADD GENERATED.*AS IDENTITY', line):
-			# This marks the start of a sequence definition
+		# Look for CREATE SEQUENCE statements
+		m = re.match(r'CREATE SEQUENCE (?:([\w]+)\.)?"?([^"]+)"?', line.strip())
+		if m:
 			if current_sequence and current_sequence_lines:
 				while current_sequence_lines and not current_sequence_lines[-1].strip():
 					current_sequence_lines.pop()
 				sequences[current_sequence] = '\n'.join(current_sequence_lines)
-			
-			# Extract sequence name from next lines
+				if current_schema:
+					sequences[f"{current_schema}.{current_sequence}"] = '\n'.join(current_sequence_lines)
+			current_schema = m.group(1) or 'public'
+			current_sequence = m.group(2)
 			current_sequence_lines = [line]
 			in_sequence = True
-			current_sequence = None  # Will be set when we find SEQUENCE NAME line
-		elif in_sequence and 'SEQUENCE NAME' in line:
-			# Extract sequence name
-			seq_match = re.search(r'SEQUENCE NAME (?:public\.)?\"?([^\"]+)\"?', line)
-			if seq_match:
-				current_sequence = seq_match.group(1)
-			current_sequence_lines.append(line)
+			continue
 		elif in_sequence:
 			current_sequence_lines.append(line)
 			# Check if this line ends the current sequence
-			if line.strip() == ');':
+			if line.strip() == ';':
 				# End of sequence definition
 				if current_sequence and current_sequence_lines:
 					while current_sequence_lines and not current_sequence_lines[-1].strip():
 						current_sequence_lines.pop()
 					sequences[current_sequence] = '\n'.join(current_sequence_lines)
+					if current_schema:
+						sequences[f"{current_schema}.{current_sequence}"] = '\n'.join(current_sequence_lines)
 				current_sequence = None
 				current_sequence_lines = []
 				in_sequence = False
@@ -680,16 +557,18 @@ def parse_schema_for_sequences(schema_ddl: str) -> dict:
 					while current_sequence_lines and not current_sequence_lines[-1].strip():
 						current_sequence_lines.pop()
 					sequences[current_sequence] = '\n'.join(current_sequence_lines)
+					if current_schema:
+						sequences[f"{current_schema}.{current_sequence}"] = '\n'.join(current_sequence_lines)
 				current_sequence = None
 				current_sequence_lines = []
 				in_sequence = False
-	
 	# Save the last sequence
 	if current_sequence and current_sequence_lines:
 		while current_sequence_lines and not current_sequence_lines[-1].strip():
 			current_sequence_lines.pop()
 		sequences[current_sequence] = '\n'.join(current_sequence_lines)
-	
+		if current_schema:
+			sequences[f"{current_schema}.{current_sequence}"] = '\n'.join(current_sequence_lines)
 	return sequences
 
 
@@ -709,29 +588,17 @@ def dump_functions_procedures(conn, outdir: Path) -> int:
 	changed = 0
 	for oid, schema, name, prokind, definition in rows:
 		folder = "procedures" if prokind == 'p' else "functions"
-		# attempt to get readable argument list for signature
-		try:
-			cur2 = conn.cursor()
-			cur2.execute("SELECT pg_get_function_identity_arguments(p.oid) FROM pg_proc p WHERE p.oid = %s", (oid,))
-			argsig = cur2.fetchone()[0] or ""
-			cur2.close()
-		except Exception:
-			argsig = ""
-
-		safe_args = re.sub(r"\W+", "_", argsig).strip("_") or "noargs"
-		filename = f"{name}__{safe_args}.psql"
-		target = outdir / folder / schema / filename
-		content = normalize_sql(definition) + "\n"
-		if write_if_changed(target, content):
+		target = outdir / folder / schema / f"{name}.psql"
+		# Normalize and write the function/procedure DDL
+		ddl = normalize_sql(definition)
+		if write_if_changed(target, ddl):
 			changed += 1
-			if VERBOSE:
-				print(f"Updated: {target}")
+			print(f"Updated: {target}")
 	cur.close()
 	return changed
 
 
 def dump_triggers(conn, outdir: Path) -> int:
-	# triggers can be obtained via pg_get_triggerdef
 	cur = conn.cursor()
 	cur.execute(
 		"""
@@ -758,157 +625,165 @@ def dump_triggers(conn, outdir: Path) -> int:
 
 
 def get_user_from_pgpass(host: str, port: int, dbname: str) -> str:
-	"""Get the user from pgpass.conf for the given connection parameters"""
-	# Only look in project folder
-	proj_pg = str(Path(__file__).resolve().parent / 'pgpass.conf')
-	
-	if not os.path.isfile(proj_pg):
-		raise FileNotFoundError(f"pgpass.conf not found in project folder: {proj_pg}. Copy pgpass.conf.example and update with your credentials.")
-	
-	# Try multiple host variations like the connection logic does
-	hosts_to_try = [host]
-	for h in ("127.0.0.1", "localhost"):
-		if h not in hosts_to_try:
-			hosts_to_try.append(h)
-	
-	try:
-		with open(proj_pg, 'r', encoding='utf-8') as f:
-			for line in f:
-				line = line.strip()
-				if not line or line.startswith('#'):
-					continue
-				
-				parts = line.split(':')
-				if len(parts) != 5:
-					continue
-				
-				pg_host, pg_port, pg_db, pg_user, pg_pass = parts
-				
-				# Check if this entry matches our connection (try all host variations)
-				for host_try in hosts_to_try:
-					if ((pg_host == '*' or pg_host == host_try) and 
-						(pg_port == '*' or pg_port == str(port)) and 
-						(pg_db == '*' or pg_db == dbname)):
-						return pg_user
-	except Exception as e:
-		raise RuntimeError(f"Error reading pgpass.conf: {e}")
-	
-	# No matching entry found
-	raise ValueError(f"No matching entry found in pgpass.conf for host={host}, port={port}, dbname={dbname}")
+    """Get the user from pgpass.conf for the given connection parameters"""
+    proj_pg = str(Path(__file__).resolve().parent / 'pgpass.conf')
+    if not os.path.isfile(proj_pg):
+        raise FileNotFoundError(f"pgpass.conf not found in project folder: {proj_pg}. Copy pgpass.conf.example and update with your credentials.")
+    hosts_to_try = [host]
+    for h in ("127.0.0.1", "localhost"):
+        if h not in hosts_to_try:
+            hosts_to_try.append(h)
+    try:
+        with open(proj_pg, 'r', encoding='utf-8') as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith('#'):
+                    continue
+                parts = line.split(':')
+                if len(parts) != 5:
+                    continue
+                pg_host, pg_port, pg_db, pg_user, pg_pass = parts
+                for host_try in hosts_to_try:
+                    if ((pg_host == '*' or pg_host == host_try) and 
+                        (pg_port == '*' or pg_port == str(port)) and 
+                        (pg_db == '*' or pg_db == dbname)):
+                        return pg_user
+    except Exception as e:
+        raise RuntimeError(f"Error reading pgpass.conf: {e}")
+    raise ValueError(f"No matching entry found in pgpass.conf for host={host}, port={port}, dbname={dbname}")
+
+
+def dump_views(conn, conninfo: dict, outdir: Path) -> int:
+    cur = conn.cursor()
+    cur.execute(
+        """
+        SELECT table_schema, table_name
+        FROM information_schema.views
+        WHERE table_schema NOT IN ('pg_catalog','information_schema','pg_toast')
+        ORDER BY table_schema, table_name
+        """
+    )
+    rows = cur.fetchall()
+    changed = 0
+    for schema, name in rows:
+        fullname = f"{schema}.{name}"
+        target = outdir / "views" / schema / f"{name}.psql"
+        try:
+            ddl = run_pg_dump(conninfo, ["--table", fullname])
+        except Exception as e:
+            print(f"Warning: failed to dump view {fullname}: {e}", file=sys.stderr)
+            continue
+        if write_if_changed(target, ddl):
+            changed += 1
+            print(f"Updated: {target}")
+    cur.close()
+    return changed
 
 
 def main():
-	ap = argparse.ArgumentParser(description="Dump Postgres objects into per-object files; update only changed files.")
-	ap.add_argument("--host", default=os.environ.get("PGHOST", "localhost"))
-	ap.add_argument("--port", default=int(os.environ.get("PGPORT", 5432)), type=int)
-	ap.add_argument("--user", default=None, help="Database user (auto-detected from pgpass if not specified)")
-	ap.add_argument("--dbname", required=True)
-	ap.add_argument("--include-data", action="store_true", help="Also dump per-table data files (data-only)")
-	ap.add_argument("--dry-run", action="store_true", help="Show changes but don't write files")
-	ap.add_argument("--verbose", action="store_true", help="Verbose logging")
-	args = ap.parse_args()
+    import argparse
+    ap = argparse.ArgumentParser(description="Dump Postgres objects into per-object files; update only changed files.")
+    ap.add_argument("--host", default=os.environ.get("PGHOST", "localhost"))
+    ap.add_argument("--port", default=int(os.environ.get("PGPORT", 5432)), type=int)
+    ap.add_argument("--user", default=None, help="Database user (auto-detected from pgpass if not specified)")
+    ap.add_argument("--dbname", required=True)
+    ap.add_argument("--include-data", action="store_true", help="Also dump per-table data files (data-only)")
+    ap.add_argument("--dry-run", action="store_true", help="Show changes but don't write files")
+    ap.add_argument("--verbose", action="store_true", help="Verbose logging")
+    ap.add_argument("--out", default=None, help="Optional root output directory; defaults to script folder")
+    args = ap.parse_args()
 
-	ap.add_argument("--out", default=None, help="Optional root output directory; defaults to script folder")
-	args = ap.parse_args()
+    # Auto-detect user from pgpass if not specified
+    if not args.user:
+        args.user = get_user_from_pgpass(args.host, args.port, args.dbname)
+        if args.verbose:
+            print(f"Auto-detected user from pgpass: {args.user}")
 
-	# Auto-detect user from pgpass if not specified
-	if not args.user:
-		args.user = get_user_from_pgpass(args.host, args.port, args.dbname)
-		if args.verbose:
-			print(f"Auto-detected user from pgpass: {args.user}")
+    conninfo = {"host": args.host, "port": args.port, "user": args.user, "dbname": args.dbname}
 
-	conninfo = {"host": args.host, "port": args.port, "user": args.user, "dbname": args.dbname}
+    # Determine output root: user-specified or script folder
+    if args.out:
+        out_root = Path(args.out).resolve()
+    else:
+        out_root = Path(__file__).resolve().parent
 
-	# Determine output root: user-specified or script folder
-	if args.out:
-		out_root = Path(args.out).resolve()
-	else:
-		out_root = Path(__file__).resolve().parent
+    outdir = out_root / args.dbname
+    outdir.mkdir(parents=True, exist_ok=True)
 
-	outdir = out_root / args.dbname
-	outdir.mkdir(parents=True, exist_ok=True)
+    global DRY_RUN, VERBOSE
+    DRY_RUN = args.dry_run
+    VERBOSE = args.verbose
 
-	global DRY_RUN, VERBOSE
-	DRY_RUN = args.dry_run
-	VERBOSE = args.verbose
+    # Ensure pgpass is used if present: prioritize PGPASSFILE env, then common locations
+    set_pgpass_env()
+    conninfo_try = {"host": args.host, "port": args.port, "user": args.user, "dbname": args.dbname}
 
-	# Ensure pgpass is used if present: prioritize PGPASSFILE env, then common locations
-	set_pgpass_env()
-	conninfo_try = {"host": args.host, "port": args.port, "user": args.user, "dbname": args.dbname}
+    def connect_with_retries(conninfo):
+        last_exc = None
+        hosts_to_try = [conninfo["host"]]
+        for h in ("127.0.0.1", "localhost"):
+            if h not in hosts_to_try:
+                hosts_to_try.append(h)
+        for h in hosts_to_try:
+            try:
+                if VERBOSE:
+                    print(f"Trying connect host={h}")
+                # Ensure password is loaded from pgpass (if present) and pass it explicitly
+                pword = load_password_from_pgpass(h, conninfo["port"], conninfo["dbname"], conninfo["user"])
+                if pword:
+                    # Store password in conninfo for pg_dump usage
+                    conninfo["password"] = pword
+                    return psycopg2.connect(host=h, port=conninfo["port"], user=conninfo["user"], dbname=conninfo["dbname"], password=pword)
+                else:
+                    return psycopg2.connect(host=h, port=conninfo["port"], user=conninfo["user"], dbname=conninfo["dbname"])
+            except Exception as e:
+                last_exc = e
+                if VERBOSE:
+                    print(f"Connect failed for host={h}: {e}")
+                continue
+        raise last_exc
 
-	def connect_with_retries(conninfo):
-		last_exc = None
-		hosts_to_try = [conninfo["host"]]
-		for h in ("127.0.0.1", "localhost"):
-			if h not in hosts_to_try:
-				hosts_to_try.append(h)
+    conn = connect_with_retries(conninfo_try)
 
-		for h in hosts_to_try:
-			try:
-				if VERBOSE:
-					print(f"Trying connect host={h}")
-				# Ensure password is loaded from pgpass (if present) and pass it explicitly
-				pword = load_password_from_pgpass(h, conninfo["port"], conninfo["dbname"], conninfo["user"]) 
-				if pword:
-					# Store password in conninfo for pg_dump usage
-					conninfo["password"] = pword
-					return psycopg2.connect(host=h, port=conninfo["port"], user=conninfo["user"], dbname=conninfo["dbname"], password=pword)
-				else:
-					return psycopg2.connect(host=h, port=conninfo["port"], user=conninfo["user"], dbname=conninfo["dbname"]) 
-			except Exception as e:
-				last_exc = e
-				if VERBOSE:
-					print(f"Connect failed for host={h}: {e}")
-				# if the error indicates missing password, continue to try other hosts
-				continue
-		# no host succeeded
-		raise last_exc
+    total_changed = 0
+    try:
+        total_changed += dump_tables(conn, conninfo, outdir, include_data=args.include_data)
+        total_changed += dump_views(conn, conninfo, outdir)
+        total_changed += dump_matviews(conn, conninfo, outdir)
+        total_changed += dump_sequences(conn, conninfo, outdir)
+        total_changed += dump_functions_procedures(conn, outdir)
+        total_changed += dump_triggers(conn, outdir)
+    finally:
+        conn.close()
 
-	conn = connect_with_retries(conninfo_try)
+    print(f"Done. Total updated files: {total_changed}")
 
-	total_changed = 0
-	try:
-		total_changed += dump_tables(conn, conninfo, outdir, include_data=args.include_data)
-		total_changed += dump_views(conn, conninfo, outdir)
-		total_changed += dump_matviews(conn, conninfo, outdir)
-		total_changed += dump_sequences(conn, conninfo, outdir)
-		total_changed += dump_functions_procedures(conn, outdir)
-		total_changed += dump_triggers(conn, outdir)
-	finally:
-		conn.close()
-
-	print(f"Done. Total updated files: {total_changed}")
-
-	# cleanup stale files: move anything not in EXPECTED_PATHS to _stale
-	cleanup_root = outdir
-	stale_root = cleanup_root / "_stale"
-	moved = 0
-	for p in cleanup_root.rglob("*"):
-		if p.is_file():
-			rp = str(p.resolve())
-			if rp.endswith('.sha256'):
-				# sidecars are expected only if the main file is expected
-				mainp = rp[:-7]
-				if mainp in EXPECTED_PATHS:
-					continue
-				# else fall through to move the sidecar too
-			if rp not in EXPECTED_PATHS:
-				rel = p.relative_to(cleanup_root)
-				dest = stale_root / rel
-				dest.parent.mkdir(parents=True, exist_ok=True)
-				if DRY_RUN:
-					if VERBOSE:
-						print(f"[DRY] Would move stale: {p} -> {dest}")
-					moved += 1
-				else:
-					shutil.move(str(p), str(dest))
-					moved += 1
-					if VERBOSE:
-						print(f"Moved stale: {p} -> {dest}")
-
-	if VERBOSE:
-		print(f"Stale files moved: {moved}")
-
+    # cleanup stale files: move anything not in EXPECTED_PATHS to _stale
+    cleanup_root = outdir
+    stale_root = cleanup_root / "_stale"
+    moved = 0
+    for p in cleanup_root.rglob("*"):
+        if p.is_file():
+            rp = str(p.resolve())
+            if rp.endswith('.sha256'):
+                mainp = rp[:-7]
+                if mainp in EXPECTED_PATHS:
+                    continue
+            if rp not in EXPECTED_PATHS:
+                rel = p.relative_to(cleanup_root)
+                dest = stale_root / rel
+                dest.parent.mkdir(parents=True, exist_ok=True)
+                if DRY_RUN:
+                    if VERBOSE:
+                        print(f"[DRY] Would move stale: {p} -> {dest}")
+                    moved += 1
+                else:
+                    shutil.move(str(p), str(dest))
+                    moved += 1
+                    if VERBOSE:
+                        print(f"Moved stale: {p} -> {dest}")
+    if VERBOSE:
+        print(f"Stale files moved: {moved}")
 
 if __name__ == "__main__":
-	main()
+    main()

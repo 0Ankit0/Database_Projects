@@ -1,0 +1,31 @@
+-- ------------------------------------------------------------
+-- File: historicdata.psql
+-- Created: 2025-08-19T01:11:19.247808+00:00
+-- Modified: 2025-08-19T01:11:19.247835+00:00
+-- Modified-By: ankit
+-- ------------------------------------------------------------
+CREATE TABLE public.historicdata (
+    id integer NOT NULL,
+    date date,
+    symbol text,
+    conf numeric,
+    open numeric,
+    high numeric,
+    low numeric,
+    close numeric,
+    ltp numeric,
+    close_minus_ltp numeric,
+    close_minus_ltp_pct numeric,
+    vwap numeric,
+    vol numeric,
+    prev_close numeric,
+    turnover numeric,
+    trans numeric,
+    diff numeric,
+    range numeric,
+    diff_pct numeric,
+    range_pct numeric,
+    vwap_pct numeric,
+    weeks_52_high numeric,
+    weeks_52_low numeric
+);

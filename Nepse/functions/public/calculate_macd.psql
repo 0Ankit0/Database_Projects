@@ -1,0 +1,155 @@
+-- ------------------------------------------------------------
+-- File: calculate_macd.psql
+-- Created: 2025-08-22T00:53:20.910663+00:00
+-- Modified: 2025-08-22T00:53:20.910676+00:00
+-- Modified-By: ankit
+-- ------------------------------------------------------------
+CREATE OR REPLACE FUNCTION public.calculate_macd(p_symbol_filter text, p_fast_period integer DEFAULT 12, p_slow_period integer DEFAULT 26, p_signal_period integer DEFAULT 9)
+ RETURNS TABLE(calculated_date date, symbol text, macd_line numeric, signal_line numeric, macd_histogram numeric)
+ LANGUAGE plpgsql
+AS $function$
+DECLARE
+    -- Periods
+    v_fast_period CONSTANT integer := p_fast_period;
+    v_slow_period CONSTANT integer := p_slow_period;
+    v_signal_period CONSTANT integer := p_signal_period;
+
+    -- Previous EMA values
+    v_prev_fast_ema numeric := 0;
+    v_prev_slow_ema numeric := 0;
+    v_prev_signal_ema numeric := 0;
+
+    -- Multipliers
+    v_fast_multiplier numeric := 2.0 / (p_fast_period + 1);
+    v_slow_multiplier numeric := 2.0 / (p_slow_period + 1);
+    v_signal_multiplier numeric := 2.0 / (p_signal_period + 1);
+
+    -- Records
+    r_fast record;
+    r_slow record;
+    r_signal record;
+
+BEGIN
+    -- Temporary working table (auto dropped at end of transaction)
+    CREATE TEMP TABLE temp_macd_data (
+        row_num bigint,
+        price_date date,
+        close_price numeric,
+        fast_ema numeric,
+        slow_ema numeric,
+        temp_macd_line numeric,
+        temp_signal_line numeric,
+        temp_macd_histogram numeric
+    ) ON COMMIT DROP;
+
+    -- Insert historical price data with row numbers
+    INSERT INTO temp_macd_data (row_num, price_date, close_price)
+    SELECT
+        ROW_NUMBER() OVER (ORDER BY h.date),
+        h.date,
+        h.close
+    FROM public.historicdata h
+    WHERE h.symbol = p_symbol_filter
+    ORDER BY h.date;
+
+    -- Check minimum data
+    IF (SELECT count(*) FROM temp_macd_data) < v_slow_period THEN
+        RAISE EXCEPTION 'Not enough data points to calculate MACD (need at least %).', v_slow_period;
+    END IF;
+
+    -------------------------------------------------
+    -- Initial EMAs (first values as SMA)
+    -------------------------------------------------
+    SELECT AVG(t.close_price) INTO v_prev_fast_ema
+    FROM (SELECT close_price FROM temp_macd_data ORDER BY price_date LIMIT v_fast_period) t;
+
+    SELECT AVG(t.close_price) INTO v_prev_slow_ema
+    FROM (SELECT close_price FROM temp_macd_data ORDER BY price_date LIMIT v_slow_period) t;
+
+    UPDATE temp_macd_data
+    WHERE row_num = v_fast_period;
+
+    UPDATE temp_macd_data
+    WHERE row_num = v_slow_period;
+
+    -------------------------------------------------
+    -- Subsequent Fast EMA
+    -------------------------------------------------
+    FOR r_fast IN
+        SELECT * FROM temp_macd_data WHERE row_num > v_fast_period ORDER BY price_date
+    LOOP
+        v_prev_fast_ema := ((r_fast.close_price - v_prev_fast_ema) * v_fast_multiplier) + v_prev_fast_ema;
+        UPDATE temp_macd_data SET fast_ema = v_prev_fast_ema WHERE row_num = r_fast.row_num;
+    END LOOP;
+
+    -------------------------------------------------
+    -- Subsequent Slow EMA
+    -------------------------------------------------
+    FOR r_slow IN
+        SELECT * FROM temp_macd_data WHERE row_num > v_slow_period ORDER BY price_date
+    LOOP
+        v_prev_slow_ema := ((r_slow.close_price - v_prev_slow_ema) * v_slow_multiplier) + v_prev_slow_ema;
+        UPDATE temp_macd_data SET slow_ema = v_prev_slow_ema WHERE row_num = r_slow.row_num;
+    END LOOP;
+
+    -------------------------------------------------
+    -- MACD Line = Fast EMA - Slow EMA
+    -------------------------------------------------
+    UPDATE temp_macd_data
+    WHERE fast_ema IS NOT NULL AND slow_ema IS NOT NULL;
+
+    -------------------------------------------------
+    -- Signal Line (EMA of MACD Line)
+    -------------------------------------------------
+    -- First signal EMA as SMA of first v_signal_period MACD values
+    SELECT AVG(sub.temp_macd_line) INTO v_prev_signal_ema
+    FROM (
+        SELECT t.temp_macd_line
+        FROM temp_macd_data t
+        WHERE t.temp_macd_line IS NOT NULL
+        ORDER BY t.price_date
+        LIMIT v_signal_period
+    ) sub;
+
+    -- Place first signal value
+    UPDATE temp_macd_data
+    WHERE row_num = (
+        SELECT row_num FROM temp_macd_data
+        WHERE temp_macd_line IS NOT NULL
+        ORDER BY price_date
+        OFFSET v_signal_period - 1 LIMIT 1
+    );
+
+    -- Continue signal EMA
+    FOR r_signal IN
+        SELECT * FROM temp_macd_data
+        WHERE temp_macd_line IS NOT NULL
+        ORDER BY price_date
+        OFFSET v_signal_period
+    LOOP
+        v_prev_signal_ema := ((r_signal.temp_macd_line - v_prev_signal_ema) * v_signal_multiplier) + v_prev_signal_ema;
+        UPDATE temp_macd_data SET temp_signal_line = v_prev_signal_ema WHERE row_num = r_signal.row_num;
+    END LOOP;
+
+    -------------------------------------------------
+    -- MACD Histogram = MACD Line - Signal Line
+    -------------------------------------------------
+    UPDATE temp_macd_data
+    WHERE temp_macd_line IS NOT NULL AND temp_signal_line IS NOT NULL;
+
+    -------------------------------------------------
+    -- Return final result
+    -------------------------------------------------
+    RETURN QUERY
+    SELECT
+        t.price_date AS calculated_date,
+        p_symbol_filter AS symbol,
+        ROUND(t.temp_macd_line, 2) AS macd_line,
+        ROUND(t.temp_signal_line, 2) AS signal_line,
+        ROUND(t.temp_macd_histogram, 2) AS macd_histogram
+    FROM temp_macd_data t
+    WHERE t.temp_macd_line IS NOT NULL AND t.temp_signal_line IS NOT NULL
+    ORDER BY t.price_date;
+
+END;
+$function$

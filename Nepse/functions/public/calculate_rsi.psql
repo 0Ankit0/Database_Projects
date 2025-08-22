@@ -1,0 +1,104 @@
+-- ------------------------------------------------------------
+-- File: calculate_rsi.psql
+-- Created: 2025-08-22T00:53:20.913943+00:00
+-- Modified: 2025-08-22T00:53:20.913955+00:00
+-- Modified-By: ankit
+-- ------------------------------------------------------------
+CREATE OR REPLACE FUNCTION public.calculate_rsi(p_symbol_filter text, p_period integer DEFAULT 14)
+ RETURNS TABLE(calculated_date date, symbol text, rsi numeric)
+ LANGUAGE plpgsql
+AS $function$
+DECLARE
+    -- RSI period, default is 14 days
+    v_period CONSTANT integer := p_period;
+    -- Variable to hold the previous day's average gain
+    v_prev_avg_gain numeric := 0;
+    -- Variable to hold the previous day's average loss
+    v_prev_avg_loss numeric := 0;
+    -- Loop counter for the initial period
+    v_counter integer := 0;
+    -- Record to iterate through the historic data
+    r_data record;
+BEGIN
+    -- Temporary table to store the daily gains, losses, and calculated RSI
+    CREATE TEMP TABLE temp_rsi_data (
+        row_num bigint,
+        daily_gain numeric,
+        daily_loss numeric,
+        avg_gain numeric,
+        avg_loss numeric,
+        rs numeric,
+        rsi numeric,
+        price_date date
+    );
+
+    -- Formula: Daily Gain = max(close - prev_close, 0), Daily Loss = max(prev_close - close, 0)
+    -- Insert historical data, calculating daily gains and losses. Using an alias 'h' to avoid ambiguity.
+    INSERT INTO temp_rsi_data (row_num, daily_gain, daily_loss, price_date)
+    SELECT
+        ROW_NUMBER() OVER (ORDER BY h.date),
+        CASE WHEN h.close > LAG(h.close, 1) OVER (ORDER BY h.date) THEN h.close - LAG(h.close, 1) OVER (ORDER BY h.date) ELSE 0 END AS daily_gain,
+        CASE WHEN h.close < LAG(h.close, 1) OVER (ORDER BY h.date) THEN LAG(h.close, 1) OVER (ORDER BY h.date) - h.close ELSE 0 END AS daily_loss,
+        h.date
+    FROM public.historicdata h
+    WHERE h.symbol = p_symbol_filter
+    ORDER BY h.date;
+
+    -- Formula: First Average Gain/Loss = Sum of Gains/Losses over the first N periods / N
+    -- Loop through the initial period to calculate the first average gain and average loss
+    FOR r_data IN SELECT * FROM temp_rsi_data ORDER BY price_date LOOP
+        v_counter := v_counter + 1;
+
+        IF v_counter <= v_period THEN
+            v_prev_avg_gain := v_prev_avg_gain + r_data.daily_gain;
+            v_prev_avg_loss := v_prev_avg_loss + r_data.daily_loss;
+        END IF;
+
+        -- Update the temp table with the first average gain and average loss
+        IF v_counter = v_period THEN
+            UPDATE temp_rsi_data
+            SET
+                avg_gain = v_prev_avg_gain / v_period,
+                avg_loss = v_prev_avg_loss / v_period
+            WHERE price_date = r_data.price_date;
+        END IF;
+    END LOOP;
+
+    -- Formula: Smoothed Average Gain/Loss = ((Previous Average Gain/Loss * (N - 1)) + Current Gain/Loss) / N
+    -- Calculate the smoothed average gain and average loss for subsequent periods
+    FOR r_data IN SELECT * FROM temp_rsi_data ORDER BY price_date OFFSET v_period LOOP
+        v_prev_avg_gain := (v_prev_avg_gain * (v_period - 1) + r_data.daily_gain) / v_period;
+        v_prev_avg_loss := (v_prev_avg_loss * (v_period - 1) + r_data.daily_loss) / v_period;
+
+        UPDATE temp_rsi_data
+        SET
+            avg_gain = v_prev_avg_gain,
+            avg_loss = v_prev_avg_loss
+        WHERE price_date = r_data.price_date;
+    END LOOP;
+
+    -- Formula: RS = Average Gain / Average Loss
+    -- Formula: RSI = 100 - (100 / (1 + RS))
+    -- Final calculation of RS and RSI
+    UPDATE temp_rsi_data
+    SET
+        rs = CASE WHEN avg_loss = 0 THEN 0 ELSE avg_gain / avg_loss END,
+        rsi = CASE
+                WHEN avg_loss = 0 AND avg_gain > 0 THEN 100
+                WHEN avg_loss = 0 AND avg_gain = 0 THEN 0
+                ELSE 100 - (100 / (1 + (avg_gain / avg_loss)))
+              END;
+
+   -- Return the final calculated RSI values, rounded to 2 decimal places
+    RETURN QUERY
+    SELECT
+        t.price_date AS calculated_date,
+        p_symbol_filter AS symbol,
+        ROUND(t.rsi, 2)
+    FROM temp_rsi_data t
+    WHERE t.rsi IS NOT NULL;
+
+    -- Drop the temporary table at the end of the function execution
+    DROP TABLE temp_rsi_data;
+END;
+$function$

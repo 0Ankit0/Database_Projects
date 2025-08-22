@@ -1,0 +1,45 @@
+-- ------------------------------------------------------------
+-- File: analyze_trends.psql
+-- Created: 2025-08-22T00:53:20.906753+00:00
+-- Modified: 2025-08-22T00:53:20.906771+00:00
+-- Modified-By: ankit
+-- ------------------------------------------------------------
+CREATE OR REPLACE PROCEDURE public.analyze_trends(IN in_symbol text DEFAULT NULL::text)
+ LANGUAGE plpgsql
+AS $procedure$
+DECLARE
+    rec record;
+    best_symbol text := NULL;
+    best_score numeric := -1e9;
+    trend_score numeric;
+    result text := '';
+BEGIN
+    FOR rec IN
+        SELECT DISTINCT symbol FROM public.historicdata
+        WHERE (in_symbol IS NULL OR symbol = in_symbol)
+    LOOP
+        -- Example: Calculate trend as difference between last 7-day and 30-day moving average
+        SELECT
+            (SELECT AVG(close) FROM public.historicdata WHERE symbol = rec.symbol AND date >= CURRENT_DATE - INTERVAL '7 days') -
+            (SELECT AVG(close) FROM public.historicdata WHERE symbol = rec.symbol AND date >= CURRENT_DATE - INTERVAL '30 days')
+        INTO trend_score;
+
+        -- You can add more sophisticated scoring here (e.g., volume, volatility, etc.)
+
+        IF in_symbol IS NULL THEN
+            IF trend_score > best_score THEN
+                best_score := trend_score;
+                best_symbol := rec.symbol;
+            END IF;
+        ELSE
+            result := result || format('Symbol: %s, Trend Score: %s\n', rec.symbol, trend_score);
+        END IF;
+    END LOOP;
+
+    IF in_symbol IS NULL THEN
+        RAISE NOTICE 'Best symbol to buy: % with score: %', best_symbol, best_score;
+    ELSE
+        RAISE NOTICE '%', result;
+    END IF;
+END;
+$procedure$
